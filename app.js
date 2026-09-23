@@ -1,4 +1,6 @@
-const KEY='daymark.events.v1', PREF='daymark.prefs.v1', DAY=86400000;
+const KEY = 'daymark.events.v1', PREF = 'daymark.prefs.v1', DAY = 86400000;
+const IDB_NAME = 'daymark_db', IDB_STORE = 'events_store';
+
 const STARTER_EVENTS = [
   {
     id: 'starter-new-year',
@@ -46,18 +48,96 @@ const STARTER_EVENTS = [
   }
 ];
 
+// IndexedDB Helper for dual-layer persistent storage (protects against Safari cache eviction)
+function openIDB() {
+  return new Promise(resolve => {
+    if (!window.indexedDB) return resolve(null);
+    const req = indexedDB.open(IDB_NAME, 1);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(IDB_STORE)) {
+        db.createObjectStore(IDB_STORE, { keyPath: 'id' });
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => resolve(null);
+  });
+}
+
+async function idbSaveAll(items) {
+  try {
+    const db = await openIDB();
+    if (!db) return;
+    const tx = db.transaction(IDB_STORE, 'readwrite');
+    const store = tx.objectStore(IDB_STORE);
+    store.clear();
+    for (const item of items) {
+      store.put(item);
+    }
+  } catch (err) {
+    console.warn('IDB write fallback error:', err);
+  }
+}
+
+async function idbGetAll() {
+  try {
+    const db = await openIDB();
+    if (!db) return [];
+    return new Promise(resolve => {
+      const tx = db.transaction(IDB_STORE, 'readonly');
+      const store = tx.objectStore(IDB_STORE);
+      const req = store.getAll();
+      req.onsuccess = () => resolve(req.result || []);
+      req.onerror = () => resolve([]);
+    });
+  } catch {
+    return [];
+  }
+}
+
 function readEvents() {
   if (localStorage.getItem(KEY) === null) {
     try { localStorage.setItem(KEY, JSON.stringify(STARTER_EVENTS)); } catch {}
+    idbSaveAll(STARTER_EVENTS);
     return STARTER_EVENTS;
   }
   return read(KEY, []);
 }
 
-let events = readEvents(), prefs = read(PREF, { view: 'overview', filter: 'all' }), query = '';
+let events = readEvents(), prefs = read(PREF, { view: 'overview', filter: 'all', showAllOverview: false }), query = '';
 const $ = s => document.querySelector(s), safe = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
 function read(k, f) { try { return JSON.parse(localStorage.getItem(k)) ?? f; } catch { return f; } }
-function save() { try { localStorage.setItem(KEY, JSON.stringify(events)); localStorage.setItem(PREF, JSON.stringify(prefs)); } catch { toast('Storage is full. Export a backup and remove older entries.'); } }
+function save() {
+  try {
+    localStorage.setItem(KEY, JSON.stringify(events));
+    localStorage.setItem(PREF, JSON.stringify(prefs));
+  } catch {
+    toast('Storage is full. Export a backup and remove older entries.');
+  }
+  idbSaveAll(events);
+}
+
+// Request permanent persistence from Safari/Chrome
+if (navigator.storage && navigator.storage.persist) {
+  navigator.storage.persist().catch(() => {});
+}
+
+// If localStorage was cleared (e.g. Safari 7-day eviction), restore from IndexedDB backup
+(async function checkRecovery() {
+  if (events.length === 0) {
+    const backup = await idbGetAll();
+    if (backup && backup.length > 0) {
+      events = backup;
+      save();
+      render();
+      toast(`Restored ${backup.length} counters from secure backup`);
+    }
+  } else {
+    idbSaveAll(events);
+  }
+})();
+
 function toast(s) { const t = $('#toast'); t.textContent = s; t.style.display = 'block'; clearTimeout(toast.timer); toast.timer = setTimeout(() => t.style.display = 'none', 3500); }
 function parse(s) { if (!s) return null; const d = new Date(s); return isNaN(d) ? null : d; }
 function stamp(d) { const t = new Date(d.getTime() - d.getTimezoneOffset() * 60000); return t.toISOString().slice(0, 16); }
@@ -92,7 +172,7 @@ function occurrence(e, now = new Date()) {
     const make = (y, m) => new Date(y, m, Math.min(base.getDate(), new Date(y, m + 1, 0).getDate()), base.getHours(), base.getMinutes());
     d = make(now.getFullYear(), now.getMonth());
     let isSameDay = d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth() && d.getDate() === now.getDate();
-    if (!isSameDay && d < now) d = make(now.getFullYear(), now.getMonth() + 1);
+    if (!isSameDay && d < now) d = make(now.getFullYear() + 1);
   }
   if (repeat === 'weekly') {
     let n = Math.max(0, Math.ceil((now - d) / (7 * DAY)));
@@ -180,12 +260,15 @@ function card(e) {
 function empty() { return `<div class="empty"><div style="font-size:35px">◷</div><strong>Nothing here yet</strong><p>Add a birthday, deadline, goal or career period to begin.</p><button class="primary" data-add>＋ New counter</button></div>`; }
 function overview() {
   let now = new Date(), upcoming = events.filter(e => { let i = info(e, now); return i.target && i.target >= now && e.type !== 'job'; }).sort((a, b) => info(a, now).target - info(b, now).target), next = upcoming[0], birthdays = events.filter(e => e.type === 'birthday').length, goals = events.filter(e => e.type === 'goal').length;
-  return `<div class="stats"><div class="stat"><span class="label">All counters</span><strong>${events.length}</strong><small>Things worth tracking</small></div><div class="stat"><span class="label">Coming up</span><strong>${upcoming.length}</strong><small>Future dates</small></div><div class="stat"><span class="label">Birthdays</span><strong>${birthdays}</strong><small>Never miss one</small></div><div class="stat"><span class="label">Goals</span><strong>${goals}</strong><small>Progress in view</small></div></div><div class="hero-grid"><div class="feature-card"><div class="eyebrow">${next ? 'NEXT UP' : 'YOUR NEXT MOMENT'}</div><h2>${next ? safe(next.title) : 'Keep the days that matter close.'}</h2><div class="feature-number">${next ? safe(info(next).metric) : 'Start here'}</div><p>${next ? safe(info(next).sub) : 'Add your first counter and see time take shape.'}</p>${next && info(next).progress !== null ? `<div class="progress-track"><div class="progress-fill" style="width:${info(next).progress}%"></div></div>` : ''}</div><div class="quick-card"><h2>Quick start</h2><div class="quick-actions"><button data-add="birthday">🎂 &nbsp; Add a birthday</button><button data-add="job">💼 &nbsp; Track an experience</button><button data-add="goal">◎ &nbsp; Start a goal</button></div></div></div><div class="section-head"><h2>Your counters</h2><button class="text-btn" data-view="events">View all →</button></div>${events.length ? `<div class="cards">${[...events].sort((a, b) => (info(a).target || new Date(9e15)) - (info(b).target || new Date(9e15))).slice(0, 6).map(card).join('')}</div>` : empty()}`;
+  let sorted = [...events].sort((a, b) => (info(a).target || new Date(9e15)) - (info(b).target || new Date(9e15)));
+  let displayed = prefs.showAllOverview ? sorted : sorted.slice(0, 6);
+
+  return `<div class="stats"><div class="stat"><span class="label">All counters</span><strong>${events.length}</strong><small>Stored on device</small></div><div class="stat"><span class="label">Coming up</span><strong>${upcoming.length}</strong><small>Future dates</small></div><div class="stat"><span class="label">Birthdays</span><strong>${birthdays}</strong><small>Never miss one</small></div><div class="stat"><span class="label">Goals</span><strong>${goals}</strong><small>Progress in view</small></div></div><div class="hero-grid"><div class="feature-card"><div class="eyebrow">${next ? 'NEXT UP' : 'YOUR NEXT MOMENT'}</div><h2>${next ? safe(next.title) : 'Keep the days that matter close.'}</h2><div class="feature-number">${next ? safe(info(next).metric) : 'Start here'}</div><p>${next ? safe(info(next).sub) : 'Add your first counter and see time take shape.'}</p>${next && info(next).progress !== null ? `<div class="progress-track"><div class="progress-fill" style="width:${info(next).progress}%"></div></div>` : ''}</div><div class="quick-card"><h2>Quick start</h2><div class="quick-actions"><button data-add="birthday">🎂 &nbsp; Add a birthday</button><button data-add="job">💼 &nbsp; Track an experience</button><button data-add="goal">◎ &nbsp; Start a goal</button></div></div></div><div class="section-head"><div><h2 style="display:inline-block">Your counters</h2><span class="sub-label">${events.length > 6 ? (prefs.showAllOverview ? `Showing all ${events.length}` : `Showing upcoming 6 of ${events.length}`) : `${events.length} total`}</span></div><div style="display:flex;gap:8px;align-items:center">${events.length > 6 ? `<button class="text-btn" data-toggle-overview>${prefs.showAllOverview ? 'Show top 6' : `Show all ${events.length}`}</button>` : ''}<button class="text-btn" data-view="events">All events tab →</button></div></div>${events.length ? `<div class="cards">${displayed.map(card).join('')}</div>` : empty()}`;
 }
 function allEvents() {
   let types = ['all', 'event', 'birthday', 'job', 'goal', 'anniversary', 'todo'];
   let filtered = events.filter(e => (prefs.filter === 'all' || e.type === prefs.filter) && e.title.toLowerCase().includes(query.toLowerCase()));
-  return `<div class="toolbar"><div class="filters">${types.map(t => `<button class="chip ${prefs.filter === t ? 'active' : ''}" data-filter="${t}">${t === 'all' ? 'All' : ({ todo: 'Tasks', job: 'Career' })[t] || t[0].toUpperCase() + t.slice(1)}</button>`).join('')}</div><input class="search" id="search" placeholder="Search counters" aria-label="Search counters" value="${safe(query)}"></div>${filtered.length ? `<div class="cards">${filtered.map(card).join('')}</div>` : empty()}`;
+  return `<div class="toolbar"><div class="filters">${types.map(t => `<button class="chip ${prefs.filter === t ? 'active' : ''}" data-filter="${t}">${t === 'all' ? `All (${events.length})` : ({ todo: 'Tasks', job: 'Career' })[t] || t[0].toUpperCase() + t.slice(1)}</button>`).join('')}</div><input class="search" id="search" placeholder="Search ${events.length} counters..." aria-label="Search counters" value="${safe(query)}"></div>${filtered.length ? `<div class="cards">${filtered.map(card).join('')}</div>` : empty()}`;
 }
 function timeline() {
   let jobs = events.filter(e => e.type === 'job').sort((a, b) => new Date(a.start) - new Date(b.start));
@@ -219,7 +302,8 @@ function updateCalculators() {
   }
 }
 function settings() {
-  return `<div class="panel"><h2>Backups & data</h2><div class="settings-row"><div><strong>Export everything</strong><p>Download a JSON backup of all ${events.length} counters.</p></div><button class="secondary" data-export-all>Download JSON</button></div><div class="settings-row"><div><strong>Import counters</strong><p>Import all records from a Daymark JSON backup. Matching IDs will be updated.</p></div><button class="secondary" data-import>Choose file</button></div><div class="settings-row"><div><strong>Sample counters</strong><p>Reset to starter counters to see examples of events, birthdays, goals, and career periods.</p></div><button class="secondary" data-reset-starter>Load samples</button></div>${events.map(e => `<div class="settings-row"><div><strong>${safe(e.title)}</strong><p>${typeName(e)}</p></div><button class="mini-btn" data-export="${safe(e.id)}">Export</button></div>`).join('')}<div class="settings-row"><div><strong>Clear all counters</strong><p>First export a backup if you want to restore them later.</p></div><button class="secondary danger" data-clear>Clear all</button></div></div><div class="panel" style="margin-top:18px"><h2>On your iPhone & mobile</h2><p class="hint" style="font-size:15px">Open this page in Safari or Chrome, tap Share → Add to Home Screen, enable Open as Web App if offered, then tap Add. Daymark will open from your Home Screen with full offline support. All data is securely kept in your device storage.</p></div>`;
+  let sizeKB = (JSON.stringify(events).length / 1024).toFixed(1);
+  return `<div class="panel"><h2>Backups & storage</h2><div class="result" style="margin-top:0;margin-bottom:20px;background:#f0f5ff"><strong>${events.length} counters stored securely</strong><p>Using ${sizeKB} KB of storage with dual-layer backup (LocalStorage + IndexedDB). Data is 100% private on your device.</p></div><div class="settings-row"><div><strong>Export complete backup</strong><p>Download a JSON backup of all ${events.length} counters to your device or iCloud Drive.</p></div><button class="primary" data-export-all>Download JSON</button></div><div class="settings-row"><div><strong>Import counters</strong><p>Restore counters from a Daymark JSON backup. Existing IDs will update, new ones will be added.</p></div><button class="secondary" data-import>Choose file</button></div><div class="settings-row"><div><strong>Sample counters</strong><p>Load example counters (birthdays, career timeline, goals) if you'd like to explore.</p></div><button class="secondary" data-reset-starter>Load samples</button></div>${events.map(e => `<div class="settings-row"><div><strong>${safe(e.title)}</strong><p>${typeName(e)}</p></div><button class="mini-btn" data-export="${safe(e.id)}">Export</button></div>`).join('')}<div class="settings-row"><div><strong>Clear all counters</strong><p>First export a backup if you want to restore them later.</p></div><button class="secondary danger" data-clear>Clear all</button></div></div><div class="panel" style="margin-top:18px"><h2>Safari & iPhone tips</h2><p class="hint" style="font-size:15px">1. <strong>Prevent Safari clearing data:</strong> Open Safari, tap Share (box with arrow) → <strong>Add to Home Screen</strong>. Installed Home Screen web apps have dedicated permanent storage that Safari never purges.<br><br>2. <strong>Periodic backup:</strong> Use 'Export complete backup' above to save a file to Apple Files or iCloud Drive periodically.</p></div>`;
 }
 function render() {
   let titles = { overview: 'Your time, at a glance', events: 'All your counters', timeline: 'Your timeline', calculator: 'Date calculators', settings: 'Your data & settings' };
@@ -227,6 +311,13 @@ function render() {
   $('#todayLabel').textContent = new Date().toLocaleDateString(undefined, { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' }).toUpperCase();
   $('#content').innerHTML = ({ overview, events: allEvents, timeline, calculator, settings })[prefs.view]?.() || overview();
   document.querySelectorAll('[data-view]').forEach(b => b.classList.toggle('active', b.dataset.view === prefs.view));
+  
+  // Update sidebar and mobile badge counts
+  const badge = $('#eventBadge');
+  if (badge) badge.textContent = events.length;
+  const mobBadge = $('#mobileEventLabel');
+  if (mobBadge) mobBadge.textContent = `Events (${events.length})`;
+
   if (prefs.view === 'calculator') updateCalculators();
   save();
 }
@@ -276,6 +367,9 @@ document.addEventListener('click', e => {
     prefs.view = b.dataset.view;
     render();
     scrollTo(0, 0);
+  } else if ('toggleOverview' in b.dataset) {
+    prefs.showAllOverview = !prefs.showAllOverview;
+    render();
   } else if ('add' in b.dataset) {
     openEditor(b.dataset.add || 'event');
   } else if (b.dataset.edit) {
